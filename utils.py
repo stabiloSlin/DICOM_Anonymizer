@@ -153,6 +153,7 @@ def load_dicom_series(
 
     slices = [_apply_rescale(ds, ds.pixel_array) for ds in datasets]
     volume = np.stack(slices, axis=0)
+    print('Volume: ',volume.min(), volume.max(), volume.dtype)
 
     meta = _extract_metadata(datasets[0])
     meta["volume_shape"] = volume.shape
@@ -177,16 +178,20 @@ def load_dicom_series(
 
 
 def _apply_rescale(ds, arr: np.ndarray) -> np.ndarray:
-    slope = float(getattr(ds, "RescaleSlope", 1) or 1)
+    slope     = float(getattr(ds, "RescaleSlope",     1) or 1)
     intercept = float(getattr(ds, "RescaleIntercept", 0) or 0)
-    if slope != 1.0 or intercept != 0.0:
-        return (arr.astype(np.float32) * slope + intercept).astype(np.int16)
-    return arr.astype(np.int16)
+    # Always go via float32 — direct uint16→int16 wraps values > 32767
+    arr_f32 = arr.astype(np.float32) * slope + intercept
+    return np.clip(arr_f32, -32768, 32767).astype(np.int16)
 
 
 def _slice_sort_key(ds) -> float:
+    # Project IPP onto the slice normal — correct for axial, coronal, sagittal
     try:
-        return float(ds.ImagePositionPatient[2])
+        iop    = [float(x) for x in ds.ImageOrientationPatient]
+        normal = np.cross(np.array(iop[:3]), np.array(iop[3:]))
+        ipp    = [float(x) for x in ds.ImagePositionPatient]
+        return float(np.dot(normal, ipp))
     except Exception:
         pass
     try:
@@ -237,29 +242,40 @@ _ANON_TAGS = [
 
 
 def _build_affine(datasets: list) -> np.ndarray:
-    """Construct a NIfTI affine from DICOM orientation/position tags."""
+    """Construct a NIfTI-RAS affine from DICOM orientation/position tags.
+
+    The volume passed to nibabel must have shape (Rows, Cols, Slices).
+    DICOM coordinates are in LPS; we convert to NIfTI-RAS by negating the
+    first two rows of the affine (flip L→R and P→A).
+    """
     ds = datasets[0]
     try:
         iop = [float(x) for x in ds.ImageOrientationPatient]
-        ipp = [float(x) for x in ds.ImagePositionPatient]
-        ps  = [float(x) for x in ds.PixelSpacing]
+        ipp = np.array([float(x) for x in ds.ImagePositionPatient])
+        ps  = [float(x) for x in ds.PixelSpacing]   # [row_spacing, col_spacing]
 
-        row_cos  = np.array(iop[:3])
-        col_cos  = np.array(iop[3:])
-        normal   = np.cross(row_cos, col_cos)
+        row_cos = np.array(iop[:3])   # direction of increasing column index
+        col_cos = np.array(iop[3:])   # direction of increasing row index
+        normal  = np.cross(row_cos, col_cos)
 
         if len(datasets) > 1:
-            ipp2    = [float(x) for x in datasets[1].ImagePositionPatient]
-            spacing = float(np.linalg.norm(np.array(ipp2) - np.array(ipp)))
+            ipp2    = np.array([float(x) for x in datasets[1].ImagePositionPatient])
+            # Signed projection onto normal — preserves direction relative to slice order
+            spacing = float(np.dot(ipp2 - ipp, normal))
         else:
             spacing = float(getattr(ds, "SliceThickness", 1.0) or 1.0)
 
-        affine = np.eye(4)
-        affine[:3, 0] = row_cos * ps[1]   # column direction → X
-        affine[:3, 1] = col_cos * ps[0]   # row direction    → Y
-        affine[:3, 2] = normal  * spacing  # slice direction  → Z
-        affine[:3, 3] = ipp
-        return affine
+        # LPS affine: maps (row_idx, col_idx, slice_idx) → LPS mm
+        affine_lps = np.eye(4)
+        affine_lps[:3, 0] = col_cos * ps[0]   # dim-0 = rows  → col_cos direction
+        affine_lps[:3, 1] = row_cos * ps[1]   # dim-1 = cols  → row_cos direction
+        affine_lps[:3, 2] = normal  * spacing  # dim-2 = slices → normal (signed)
+        affine_lps[:3, 3] = ipp
+
+        # LPS → RAS: negate X and Y components (rows 0 and 1)
+        lps_to_ras = np.diag([-1., -1., 1., 1.])
+        return lps_to_ras @ affine_lps
+
     except Exception:
         return np.eye(4)
 
@@ -270,17 +286,17 @@ def export_nifti(datasets: list, output_path: str | Path, patient_name: str) -> 
     All identifying DICOM metadata is stripped; only the pseudonym is stored
     in the NIfTI description field.
     """
+    # Shape (Rows, Cols, Slices) — matches _build_affine's (row, col, slice) mapping
     volume = np.stack(
         [_apply_rescale(ds, ds.pixel_array) for ds in datasets], axis=2
-    )  # shape (Y, X, Z) — NIfTI convention
-
-    volume = np.transpose(volume,[1,0,2])
-    volume = volume[:,:,::-1]
+    )
 
     affine = _build_affine(datasets)
     img    = nib.Nifti1Image(volume, affine)
     hdr    = img.header
     hdr.set_xyzt_units("mm", "sec")
+    hdr.set_sform(affine, code=1)   # scanner RAS coordinates
+    hdr.set_qform(affine, code=1)
     hdr["descrip"] = f"Anon:{patient_name}".encode()[:80]
 
     output_path = Path(output_path)
