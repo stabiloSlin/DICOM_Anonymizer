@@ -17,6 +17,7 @@ _ADJECTIVES = [
     "Safe", "Soft", "Wild", "Warm", "Brave", "Fresh", "Grand", "Lean",
     "Mild", "Neat", "Rich", "Slim", "Strong", "Tall", "Wide", "Dark",
     "Smooth", "Stern", "Noble", "Brisk", "Crisp", "Fleet", "Stout", "Tidy",
+    
 ]
 
 _NOUNS = [
@@ -26,6 +27,13 @@ _NOUNS = [
     "Tide", "Trail", "Wave", "Wood", "Canyon", "Cliff", "Coast", "Crest",
     "Delta", "Glen", "Heath", "Inlet", "Isle", "Knoll", "Mesa", "Pass",
     "Pond", "Reef", "Sand", "Slope", "Dune", "Mound", "Birch", "Hazel",
+    "Trout", "Salmon", "Bass", "Pike", "Carp", "Perch", "Walleye",
+    "Cod", "Herring", "Mackerel", "Sardine", "Anchovy", "Grouper", "Snapper",
+    "Tuna", "Marlin", "Swordfish", "Flounder", "Halibut", "Tilapia", "Catfish",
+    "Sturgeon", "Barracuda", "Eel", "Garfish", "MahiMahi", "Sailfish", "Trout",
+    "Bluegill", "Crappie", "Dorado", "Perch", "Wahoo", "Zander","Yellowtail",
+    "Albacore", "Amberjack", "Butterfish", "Cobia", "Dorado", "Escolar", "Grouper",
+    "Zander","Hecht","Schmerle",
 ]
 
 
