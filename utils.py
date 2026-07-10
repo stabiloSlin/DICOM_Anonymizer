@@ -182,6 +182,9 @@ def load_dicom_series(
     meta["data_min"] = int(volume.min())
     meta["data_max"] = int(volume.max())
 
+    # Affine mapping display index order (Z=slice, Y=row, X=col) → RAS mm.
+    meta["display_affine"] = build_display_affine(datasets)
+
     return volume, datasets, meta
 
 
@@ -249,6 +252,34 @@ _ANON_TAGS = [
 ]
 
 
+def _geometry(datasets: list):
+    """Return (row_cos, col_cos, normal, ps, spacing, ipp) from DICOM tags.
+
+    row_cos : direction of increasing column index (iop[:3])
+    col_cos : direction of increasing row index    (iop[3:])
+    normal  : slice normal = row_cos × col_cos
+    ps      : [row_spacing, col_spacing] in mm
+    spacing : signed inter-slice spacing along the normal
+    ipp     : ImagePositionPatient of the first slice (LPS mm)
+    """
+    ds  = datasets[0]
+    iop = [float(x) for x in ds.ImageOrientationPatient]
+    ipp = np.array([float(x) for x in ds.ImagePositionPatient])
+    ps  = [float(x) for x in ds.PixelSpacing]   # [row_spacing, col_spacing]
+
+    row_cos = np.array(iop[:3])
+    col_cos = np.array(iop[3:])
+    normal  = np.cross(row_cos, col_cos)
+
+    if len(datasets) > 1:
+        ipp2    = np.array([float(x) for x in datasets[1].ImagePositionPatient])
+        spacing = float(np.dot(ipp2 - ipp, normal))
+    else:
+        spacing = float(getattr(ds, "SliceThickness", 1.0) or 1.0)
+
+    return row_cos, col_cos, normal, ps, spacing, ipp
+
+
 def _build_affine(datasets: list) -> np.ndarray:
     """Construct a NIfTI-RAS affine from DICOM orientation/position tags.
 
@@ -256,22 +287,8 @@ def _build_affine(datasets: list) -> np.ndarray:
     DICOM coordinates are in LPS; we convert to NIfTI-RAS by negating the
     first two rows of the affine (flip L→R and P→A).
     """
-    ds = datasets[0]
     try:
-        iop = [float(x) for x in ds.ImageOrientationPatient]
-        ipp = np.array([float(x) for x in ds.ImagePositionPatient])
-        ps  = [float(x) for x in ds.PixelSpacing]   # [row_spacing, col_spacing]
-
-        row_cos = np.array(iop[:3])   # direction of increasing column index
-        col_cos = np.array(iop[3:])   # direction of increasing row index
-        normal  = np.cross(row_cos, col_cos)
-
-        if len(datasets) > 1:
-            ipp2    = np.array([float(x) for x in datasets[1].ImagePositionPatient])
-            # Signed projection onto normal — preserves direction relative to slice order
-            spacing = float(np.dot(ipp2 - ipp, normal))
-        else:
-            spacing = float(getattr(ds, "SliceThickness", 1.0) or 1.0)
+        row_cos, col_cos, normal, ps, spacing, ipp = _geometry(datasets)
 
         # LPS affine: maps (row_idx, col_idx, slice_idx) → LPS mm
         affine_lps = np.eye(4)
@@ -281,6 +298,34 @@ def _build_affine(datasets: list) -> np.ndarray:
         affine_lps[:3, 3] = ipp
 
         # LPS → RAS: negate X and Y components (rows 0 and 1)
+        lps_to_ras = np.diag([-1., -1., 1., 1.])
+        return lps_to_ras @ affine_lps
+
+    except Exception:
+        return np.eye(4)
+
+
+def build_display_affine(datasets: list) -> np.ndarray:
+    """RAS affine for the *display* volume index order (Z=slice, Y=row, X=col).
+
+    The viewer stacks slices on axis 0, so its volume has shape
+    (n_slices, Rows, Cols) == (Z, Y, X). This affine maps a homogeneous
+    index vector [Z, Y, X, 1] to Slicer-style RAS millimetres, following the
+    LPS→RAS convention used throughout (3D Slicer stores coordinates in RAS).
+
+    Returns the 4x4 identity if orientation tags are missing, so callers can
+    always assume a usable matrix.
+    """
+    try:
+        row_cos, col_cos, normal, ps, spacing, ipp = _geometry(datasets)
+
+        # LPS affine for index order (slice, row, col):
+        affine_lps = np.eye(4)
+        affine_lps[:3, 0] = normal  * spacing  # dim-0 = slices (Z)
+        affine_lps[:3, 1] = col_cos * ps[0]    # dim-1 = rows   (Y)
+        affine_lps[:3, 2] = row_cos * ps[1]    # dim-2 = cols   (X)
+        affine_lps[:3, 3] = ipp
+
         lps_to_ras = np.diag([-1., -1., 1., 1.])
         return lps_to_ras @ affine_lps
 

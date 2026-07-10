@@ -293,6 +293,21 @@ class _LeftPanel(QWidget):
         grp2.setLayout(v2)
         outer.addWidget(grp2)
 
+        # Coordinates (live cursor readout)
+        grp3 = QGroupBox("Coordinates")
+        v3 = QVBoxLayout()
+        v3.setSpacing(3)
+        hint = QLabel("Hover over a view")
+        hint.setObjectName("MetaKey")
+        v3.addWidget(hint)
+        self.coord_ras   = _InfoRow("RAS mm")
+        self.coord_voxel = _InfoRow("Voxel")
+        self.coord_value = _InfoRow("Value")
+        for w in [self.coord_ras, self.coord_voxel, self.coord_value]:
+            v3.addWidget(w)
+        grp3.setLayout(v3)
+        outer.addWidget(grp3)
+
         outer.addStretch()
 
     def update(self, meta: dict) -> None:
@@ -309,6 +324,24 @@ class _LeftPanel(QWidget):
         self.pt_dob.set(meta.get("patient_dob", ""))
         self.pt_sex.set(meta.get("patient_sex", ""))
         self.pt_age.set(meta.get("patient_age", ""))
+
+    def update_coords(self, info: dict | None) -> None:
+        """Update the live coordinate readout from a viewer hover event."""
+        if not info:
+            for w in (self.coord_ras, self.coord_voxel, self.coord_value):
+                w.set("")
+            return
+        ras = info.get("ras")
+        if ras is not None:
+            self.coord_ras.set(f"{ras[0]:.1f}, {ras[1]:.1f}, {ras[2]:.1f}")
+        else:
+            self.coord_ras.set("n/a")
+        vx = info.get("voxel")
+        if vx is not None:
+            self.coord_voxel.set(f"{vx[0]}, {vx[1]}, {vx[2]}")
+        val = info.get("value")
+        if val is not None:
+            self.coord_value.set(f"{val:.0f}")
 
 
 # ── Right panel (anonymisation + export) ─────────────────────────────────────
@@ -790,6 +823,7 @@ class MainWindow(QMainWindow):
         self._right.wl_changed.connect(
             lambda wc, ww: self._viewer.set_wl(wc, ww)
         )
+        self._viewer.coords_changed.connect(self._left.update_coords)
         self._right.export_nifti_req.connect(self._export_nifti)
         self._right.connect_req.connect(self._connect_exact)
         self._right.export_exact_req.connect(self._export_exact)
@@ -873,7 +907,10 @@ class MainWindow(QMainWindow):
         self._datasets = datasets
         self._meta     = meta
         self._left.update(meta)
-        self._viewer.load_volume(volume, meta["window_center"], meta["window_width"])
+        self._viewer.load_volume(
+            volume, meta["window_center"], meta["window_width"],
+            meta.get("display_affine"),
+        )
         self._right.set_wl_defaults(meta["window_center"], meta["window_width"])
         self._right.set_loaded(meta["patient_name"], meta["patient_id"])
 
