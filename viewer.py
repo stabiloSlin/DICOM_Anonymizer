@@ -26,6 +26,8 @@ class _SliceView(QWidget):
     #   dict(voxel=(Z, Y, X), ...)  when hovering a valid pixel
     #   None                        when the cursor leaves the image
     hovered      = pyqtSignal(object)
+    # Emitted on a left-click over the image, with the same info dict as hovered.
+    clicked      = pyqtSignal(object)
     # Emitted when this view's slice index changes (int slice index).
     slice_changed = pyqtSignal(int)
 
@@ -69,6 +71,7 @@ class _SliceView(QWidget):
         )
         self.canvas.installEventFilter(self)
         self.canvas.mpl_connect("motion_notify_event", self._on_motion)
+        self.canvas.mpl_connect("button_press_event",  self._on_click)
         self.canvas.mpl_connect("axes_leave_event",    self._on_leave)
         self.canvas.mpl_connect("figure_leave_event",  self._on_leave)
         layout.addWidget(self.canvas, stretch=1)
@@ -163,6 +166,12 @@ class _SliceView(QWidget):
         self.slider.setValue(
             max(0, min(self.slider.maximum(), self.slider.value() + delta))
         )
+
+    def set_slice(self, idx: int) -> None:
+        """Jump to slice *idx* (clamped). Used to sync views on click."""
+        idx = max(0, min(self.slider.maximum(), int(idx)))
+        if self.slider.value() != idx:
+            self.slider.setValue(idx)
 
     def _refresh(self, idx: int) -> None:
         if self.volume is None:
@@ -272,6 +281,21 @@ class _SliceView(QWidget):
 
     # ── Mouse handlers ─────────────────────────────────────────────────────────
 
+    def _build_info(self, voxel: tuple[int, int, int]) -> dict:
+        """Assemble the coordinate info dict for a volume index (Z, Y, X)."""
+        z, y, x = voxel
+        value = float(self.volume[z, y, x])
+        ras = None
+        if self.affine is not None:
+            r = self.affine @ np.array([z, y, x, 1.0])
+            ras = (float(r[0]), float(r[1]), float(r[2]))
+        sx, sy, sz = self.spacing
+        world = (x * sx, y * sy, z * sz)   # image-coord mm from volume corner
+        return {
+            "voxel": (x, y, z), "index": voxel,
+            "ras": ras, "world": world, "value": value,
+        }
+
     def _on_motion(self, event) -> None:
         if self.volume is None or event.inaxes is not self.ax:
             return
@@ -281,18 +305,16 @@ class _SliceView(QWidget):
         if voxel is None:
             self.hovered.emit(None)
             return
-        z, y, x = voxel
-        value = float(self.volume[z, y, x])
-        ras = None
-        if self.affine is not None:
-            r = self.affine @ np.array([z, y, x, 1.0])
-            ras = (float(r[0]), float(r[1]), float(r[2]))
-        sx, sy, sz = self.spacing
-        world = (x * sx, y * sy, z * sz)   # image-coord mm from volume corner
-        self.hovered.emit({
-            "voxel": (x, y, z), "index": voxel,
-            "ras": ras, "world": world, "value": value,
-        })
+        self.hovered.emit(self._build_info(voxel))
+
+    def _on_click(self, event) -> None:
+        if self.volume is None or event.inaxes is not self.ax:
+            return
+        if event.button != 1 or event.xdata is None or event.ydata is None:
+            return
+        voxel = self._cursor_to_voxel(event.xdata, event.ydata)
+        if voxel is not None:
+            self.clicked.emit(self._build_info(voxel))
 
     def _on_leave(self, event) -> None:
         self.hovered.emit(None)
@@ -346,6 +368,7 @@ class DicomViewer(QWidget):
         # Cross-view coordination
         for view in (self.axial, self.coronal, self.sagittal):
             view.hovered.connect(self._on_hover)
+            view.clicked.connect(self._on_click)
             view.slice_changed.connect(self._on_slice_changed)
 
     @property
@@ -364,6 +387,21 @@ class DicomViewer(QWidget):
     def _on_hover(self, info) -> None:
         voxel = info["index"] if info else None
         self._last_voxel = voxel
+        for view in self._views:
+            view.update_crosshair(voxel)
+        self.coords_changed.emit(info)
+
+    def _on_click(self, info) -> None:
+        """Sync all views to the clicked point so it becomes their intersection."""
+        if not info:
+            return
+        voxel = info["index"]
+        z, y, x = voxel
+        self._last_voxel = voxel
+        # Each view jumps to the slice containing the clicked voxel.
+        self.axial.set_slice(z)     # axis 0 → Z
+        self.coronal.set_slice(y)   # axis 1 → Y
+        self.sagittal.set_slice(x)  # axis 2 → X
         for view in self._views:
             view.update_crosshair(voxel)
         self.coords_changed.emit(info)
