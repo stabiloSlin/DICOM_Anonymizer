@@ -305,6 +305,15 @@ class _LeftPanel(QWidget):
         self.coord_value = _InfoRow("Value")
         for w in [self.coord_ras, self.coord_voxel, self.coord_value]:
             v3.addWidget(w)
+
+        # Image-coordinate mm (index × spacing, volume-corner origin) —
+        # matches the external navigation device readout.
+        self.coord_x = _InfoRow("x")
+        self.coord_y = _InfoRow("y")
+        self.coord_z = _InfoRow("z")
+        for w in [self.coord_x, self.coord_y, self.coord_z]:
+            v3.addWidget(w)
+
         grp3.setLayout(v3)
         outer.addWidget(grp3)
 
@@ -328,7 +337,8 @@ class _LeftPanel(QWidget):
     def update_coords(self, info: dict | None) -> None:
         """Update the live coordinate readout from a viewer hover event."""
         if not info:
-            for w in (self.coord_ras, self.coord_voxel, self.coord_value):
+            for w in (self.coord_ras, self.coord_voxel, self.coord_value,
+                      self.coord_x, self.coord_y, self.coord_z):
                 w.set("")
             return
         ras = info.get("ras")
@@ -342,6 +352,11 @@ class _LeftPanel(QWidget):
         val = info.get("value")
         if val is not None:
             self.coord_value.set(f"{val:.0f}")
+        world = info.get("world")
+        if world is not None:
+            self.coord_x.set(f"{world[0]:.2f} mm")
+            self.coord_y.set(f"{world[1]:.2f} mm")
+            self.coord_z.set(f"{world[2]:.2f} mm")
 
 
 # ── Right panel (anonymisation + export) ─────────────────────────────────────
@@ -909,7 +924,7 @@ class MainWindow(QMainWindow):
         self._left.update(meta)
         self._viewer.load_volume(
             volume, meta["window_center"], meta["window_width"],
-            meta.get("display_affine"),
+            meta.get("display_affine"), meta.get("voxel_spacing"),
         )
         self._right.set_wl_defaults(meta["window_center"], meta["window_width"])
         self._right.set_loaded(meta["patient_name"], meta["patient_id"])

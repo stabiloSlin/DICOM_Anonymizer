@@ -185,6 +185,15 @@ def load_dicom_series(
     # Affine mapping display index order (Z=slice, Y=row, X=col) → RAS mm.
     meta["display_affine"] = build_display_affine(datasets)
 
+    # Per-axis voxel spacing in (X, Y, Z) = (col, row, slice) order, in mm.
+    # Used for the image-coordinate readout: coordinate = voxel_index * spacing,
+    # measured from the volume corner (matches external navigation devices).
+    try:
+        _, _, _, ps, sp, _ = _geometry(datasets)
+        meta["voxel_spacing"] = (float(ps[1]), float(ps[0]), abs(float(sp)))
+    except Exception:
+        meta["voxel_spacing"] = (1.0, 1.0, 1.0)
+
     return volume, datasets, meta
 
 

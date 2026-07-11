@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import numpy as np
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QSplitter, QLabel, QSlider, QSizePolicy,
+    QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QLabel, QSlider,
+    QPushButton, QSizePolicy,
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 
@@ -33,6 +34,7 @@ class _SliceView(QWidget):
         self.axis   = axis
         self.volume: np.ndarray | None = None
         self.affine: np.ndarray | None = None
+        self.spacing: tuple[float, float, float] = (1.0, 1.0, 1.0)  # (X, Y, Z) mm
         self.wc     = 0.0
         self.ww     = 2000.0
         self._im    = None
@@ -71,11 +73,32 @@ class _SliceView(QWidget):
         self.canvas.mpl_connect("figure_leave_event",  self._on_leave)
         layout.addWidget(self.canvas, stretch=1)
 
+        # Slider with single-step prev/next buttons on either side
+        slider_row = QHBoxLayout()
+        slider_row.setContentsMargins(0, 0, 0, 0)
+        slider_row.setSpacing(4)
+
+        self.prev_btn = QPushButton("◀")
+        self.prev_btn.setObjectName("small")
+        self.prev_btn.setFixedWidth(28)
+        self.prev_btn.setToolTip("Previous slice")
+        self.prev_btn.clicked.connect(lambda: self._step(-1))
+        slider_row.addWidget(self.prev_btn)
+
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.setMinimum(0)
         self.slider.setMaximum(0)
         self.slider.valueChanged.connect(self._on_slider)
-        layout.addWidget(self.slider)
+        slider_row.addWidget(self.slider, stretch=1)
+
+        self.next_btn = QPushButton("▶")
+        self.next_btn.setObjectName("small")
+        self.next_btn.setFixedWidth(28)
+        self.next_btn.setToolTip("Next slice")
+        self.next_btn.clicked.connect(lambda: self._step(1))
+        slider_row.addWidget(self.next_btn)
+
+        layout.addLayout(slider_row)
 
         self.pos_lbl = QLabel("—")
         self.pos_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -85,9 +108,11 @@ class _SliceView(QWidget):
     # ── Public API ────────────────────────────────────────────────────────────
 
     def load(self, volume: np.ndarray, wc: float, ww: float,
-             affine: np.ndarray | None = None) -> None:
+             affine: np.ndarray | None = None,
+             spacing: tuple[float, float, float] | None = None) -> None:
         self.volume = volume
         self.affine = affine
+        self.spacing = spacing or (1.0, 1.0, 1.0)
         self.wc = wc
         self.ww = ww
         self._im = None  # force re-creation of imshow
@@ -108,6 +133,7 @@ class _SliceView(QWidget):
     def clear(self) -> None:
         self.volume = None
         self.affine = None
+        self.spacing = (1.0, 1.0, 1.0)
         self._im    = None
         self._vline = None
         self._hline = None
@@ -131,6 +157,12 @@ class _SliceView(QWidget):
     def _on_slider(self, value: int) -> None:
         self._refresh(value)
         self.slice_changed.emit(value)
+
+    def _step(self, delta: int) -> None:
+        """Move exactly one slice forward (+1) or backward (-1), clamped."""
+        self.slider.setValue(
+            max(0, min(self.slider.maximum(), self.slider.value() + delta))
+        )
 
     def _refresh(self, idx: int) -> None:
         if self.volume is None:
@@ -255,7 +287,12 @@ class _SliceView(QWidget):
         if self.affine is not None:
             r = self.affine @ np.array([z, y, x, 1.0])
             ras = (float(r[0]), float(r[1]), float(r[2]))
-        self.hovered.emit({"voxel": (x, y, z), "index": voxel, "ras": ras, "value": value})
+        sx, sy, sz = self.spacing
+        world = (x * sx, y * sy, z * sz)   # image-coord mm from volume corner
+        self.hovered.emit({
+            "voxel": (x, y, z), "index": voxel,
+            "ras": ras, "world": world, "value": value,
+        })
 
     def _on_leave(self, event) -> None:
         self.hovered.emit(None)
@@ -265,10 +302,7 @@ class _SliceView(QWidget):
         from PyQt6.QtCore import QEvent
         if obj is self.canvas and event.type() == QEvent.Type.Wheel:
             delta = event.angleDelta().y()
-            step  = 1 if delta > 0 else -1
-            self.slider.setValue(
-                max(0, min(self.slider.maximum(), self.slider.value() - step))
-            )
+            self._step(-1 if delta > 0 else 1)
             return True
         return super().eventFilter(obj, event)
 
@@ -319,10 +353,11 @@ class DicomViewer(QWidget):
         return (self.axial, self.coronal, self.sagittal)
 
     def load_volume(self, volume: np.ndarray, wc: float, ww: float,
-                    affine: np.ndarray | None = None) -> None:
+                    affine: np.ndarray | None = None,
+                    spacing: tuple[float, float, float] | None = None) -> None:
         self._last_voxel = None
         for view in self._views:
-            view.load(volume, wc, ww, affine)
+            view.load(volume, wc, ww, affine, spacing)
 
     # ── Cross-view crosshair coordination ──────────────────────────────────────
 
