@@ -28,7 +28,7 @@ from PyQt6.QtWidgets import (
     QHeaderView, QDialogButtonBox,
 )
 from PyQt6.QtCore import Qt, QSettings, QThread, pyqtSignal
-from PyQt6.QtGui import QAction, QFont, QGuiApplication
+from PyQt6.QtGui import QAction, QFont, QGuiApplication, QDoubleValidator
 
 import utils
 import exact_client as ec
@@ -255,6 +255,10 @@ class _InfoRow(QWidget):
 # ── Left panel (metadata display) ────────────────────────────────────────────
 
 class _LeftPanel(QWidget):
+    # Emitted when the user requests navigation to a typed coordinate.
+    #   (system, a, b, c) where system is "ras" | "voxel" | "xyz"
+    goto_requested = pyqtSignal(str, float, float, float)
+
     def __init__(self) -> None:
         super().__init__()
         self.setObjectName("LeftPanel")
@@ -317,6 +321,38 @@ class _LeftPanel(QWidget):
         grp3.setLayout(v3)
         outer.addWidget(grp3)
 
+        # Go-to-coordinate input
+        grp4 = QGroupBox("Gehe zu Koordinate")
+        v4 = QVBoxLayout()
+        v4.setSpacing(5)
+
+        # Coordinate-system selector at the top
+        self.goto_system = QComboBox()
+        self.goto_system.addItems(["RAS mm", "Voxel", "XYZ"])
+        self.goto_system.currentTextChanged.connect(self._update_goto_hints)
+        v4.addWidget(self.goto_system)
+
+        # Three input fields
+        fields_row = QHBoxLayout()
+        fields_row.setSpacing(4)
+        self.goto_a = QLineEdit()
+        self.goto_b = QLineEdit()
+        self.goto_c = QLineEdit()
+        for e in (self.goto_a, self.goto_b, self.goto_c):
+            e.setValidator(QDoubleValidator())
+            e.returnPressed.connect(self._emit_goto)
+            fields_row.addWidget(e)
+        v4.addLayout(fields_row)
+
+        # Update button
+        self.goto_btn = QPushButton("Aktualisieren")
+        self.goto_btn.clicked.connect(self._emit_goto)
+        v4.addWidget(self.goto_btn)
+
+        grp4.setLayout(v4)
+        outer.addWidget(grp4)
+        self._update_goto_hints(self.goto_system.currentText())
+
         outer.addStretch()
 
     def update(self, meta: dict) -> None:
@@ -357,6 +393,31 @@ class _LeftPanel(QWidget):
             self.coord_x.set(f"{world[0]:.2f} mm")
             self.coord_y.set(f"{world[1]:.2f} mm")
             self.coord_z.set(f"{world[2]:.2f} mm")
+
+    # ── Go-to-coordinate ───────────────────────────────────────────────────────
+
+    _GOTO_HINTS = {
+        "RAS mm": ("R", "A", "S"),
+        "Voxel":  ("x", "y", "z"),
+        "XYZ":    ("x mm", "y mm", "z mm"),
+    }
+    _GOTO_KEYS = {"RAS mm": "ras", "Voxel": "voxel", "XYZ": "xyz"}
+
+    def _update_goto_hints(self, system_text: str) -> None:
+        a, b, c = self._GOTO_HINTS.get(system_text, ("x", "y", "z"))
+        self.goto_a.setPlaceholderText(a)
+        self.goto_b.setPlaceholderText(b)
+        self.goto_c.setPlaceholderText(c)
+
+    def _emit_goto(self) -> None:
+        key = self._GOTO_KEYS.get(self.goto_system.currentText(), "voxel")
+        try:
+            a = float(self.goto_a.text().replace(",", "."))
+            b = float(self.goto_b.text().replace(",", "."))
+            c = float(self.goto_c.text().replace(",", "."))
+        except ValueError:
+            return
+        self.goto_requested.emit(key, a, b, c)
 
 
 # ── Right panel (anonymisation + export) ─────────────────────────────────────
@@ -839,6 +900,7 @@ class MainWindow(QMainWindow):
             lambda wc, ww: self._viewer.set_wl(wc, ww)
         )
         self._viewer.coords_changed.connect(self._left.update_coords)
+        self._left.goto_requested.connect(self._goto_coordinate)
         self._right.export_nifti_req.connect(self._export_nifti)
         self._right.connect_req.connect(self._connect_exact)
         self._right.export_exact_req.connect(self._export_exact)
@@ -941,6 +1003,20 @@ class MainWindow(QMainWindow):
             f"Loaded {n} slices  —  {shape_str}  |  "
             f"{meta.get('modality', '')}  {meta.get('study_date', '')}"
         )
+
+    def _goto_coordinate(self, system: str, a: float, b: float, c: float) -> None:
+        if self._datasets is None:
+            self.statusBar().showMessage("Keine DICOM-Daten geladen.")
+            return
+        ok = self._viewer.goto(system, a, b, c)
+        if ok:
+            self.statusBar().showMessage(
+                f"Navigiert zu {system.upper()}: {a:g}, {b:g}, {c:g}"
+            )
+        elif system == "ras":
+            self.statusBar().showMessage(
+                "RAS-Navigation nicht verfügbar (keine gültige Orientierung im DICOM)."
+            )
 
     def _on_load_error(self, msg: str) -> None:
         print('Showing message: ',msg)

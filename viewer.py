@@ -412,6 +412,52 @@ class DicomViewer(QWidget):
         for view in self._views:
             view.update_crosshair(self._last_voxel)
 
+    def goto(self, system: str, a: float, b: float, c: float) -> bool:
+        """Navigate all views to a coordinate given in *system*.
+
+        system : "ras"   → (a, b, c) = R, A, S in mm
+                 "voxel" → (a, b, c) = x, y, z voxel indices (col, row, slice)
+                 "xyz"   → (a, b, c) = x, y, z in mm (index × spacing)
+
+        Returns True if navigation happened, False if the input could not be
+        used (no volume loaded, or RAS requested without a valid affine).
+        """
+        vol = self.axial.volume
+        if vol is None:
+            return False
+        nz, ny, nx = vol.shape
+
+        if system == "voxel":
+            x, y, z = int(round(a)), int(round(b)), int(round(c))
+        elif system == "xyz":
+            sx, sy, sz = self.axial.spacing
+            x = int(round(a / sx)) if sx else 0
+            y = int(round(b / sy)) if sy else 0
+            z = int(round(c / sz)) if sz else 0
+        elif system == "ras":
+            aff = self.axial.affine
+            if aff is None:
+                return False
+            idx = np.linalg.inv(aff) @ np.array([a, b, c, 1.0])
+            z, y, x = int(round(idx[0])), int(round(idx[1])), int(round(idx[2]))
+        else:
+            return False
+
+        # Clamp into the volume so out-of-range input still lands on a valid slice.
+        x = max(0, min(nx - 1, x))
+        y = max(0, min(ny - 1, y))
+        z = max(0, min(nz - 1, z))
+        voxel = (z, y, x)
+
+        self._last_voxel = voxel
+        self.axial.set_slice(z)
+        self.coronal.set_slice(y)
+        self.sagittal.set_slice(x)
+        for view in self._views:
+            view.update_crosshair(voxel)
+        self.coords_changed.emit(self.axial._build_info(voxel))
+        return True
+
     def set_wl(self, wc: float, ww: float) -> None:
         for view in (self.axial, self.coronal, self.sagittal):
             view.set_wl(wc, ww)
