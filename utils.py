@@ -238,8 +238,100 @@ def load_dicom_series(
 
     meta["source_path"] = str(path)
     meta["source_name"] = Path(path).name
+    meta["source_kind"] = "dicom"
 
     return volume, datasets, meta
+
+
+def load_nifti(path: str | Path) -> tuple[np.ndarray, None, dict]:
+    """Load a NIfTI file into the same internal representation as a DICOM series.
+
+    Returns (volume, None, meta) where *volume* has shape (Z, Y, X) with the same
+    axis convention the DICOM path produces (axis0→Superior, axis1→Posterior,
+    axis2→Left), so the viewer, hovering, crosshair and coordinate logic behave
+    identically. *datasets* is None (NIfTI has no per-slice datasets).
+    """
+    from nibabel.orientations import (
+        io_orientation, axcodes2ornt, ornt_transform,
+        apply_orientation, inv_ornt_aff, aff2axcodes,
+    )
+
+    path = Path(path)
+    img = nib.load(str(path))
+
+    data = np.asanyarray(img.dataobj)          # raw stored dtype (keeps int16 for CT)
+    while data.ndim > 3:                       # drop any 4th+ dimension (e.g. time)
+        data = data[..., 0]
+
+    nifti_dtype       = str(data.dtype)
+    nifti_orientation = "".join(aff2axcodes(img.affine))   # native file orientation
+    nifti_dims        = "×".join(str(int(d)) for d in img.shape[:3])
+    # Apply intensity scaling if the header defines a non-trivial slope/intercept.
+    slope, inter = img.header.get_slope_inter()
+    if (slope not in (None, 1.0)) or (inter not in (None, 0.0)):
+        data = data.astype(np.float32) * (slope or 1.0) + (inter or 0.0)
+    if data.dtype == np.float64:
+        data = data.astype(np.float32)
+
+    # Reorient the array to the DICOM internal layout: (Z, Y, X) with
+    # axis0→Superior, axis1→Posterior, axis2→Left.
+    orig_ornt = io_orientation(img.affine)
+    targ_ornt = axcodes2ornt(("S", "P", "L"))
+    xfm       = ornt_transform(orig_ornt, targ_ornt)
+    volume    = np.ascontiguousarray(apply_orientation(data, xfm))
+    affine    = img.affine @ inv_ornt_aff(xfm, data.shape)   # [Z,Y,X,1] → RAS mm
+
+    nz, ny, nx = volume.shape
+
+    # Window / level from robust statistics. Use the MIDPOINT of the p1–p99
+    # range as the centre (not the median): CT/CBCT volumes are dominated by
+    # air, which drags the median low and washes the image out too bright.
+    finite = volume[np.isfinite(volume)]
+    if finite.size:
+        lo = float(np.percentile(finite, 1))
+        hi = float(np.percentile(finite, 99))
+        wc = (lo + hi) / 2.0
+        ww = max(hi - lo, 1.0)
+        dmin, dmax = float(finite.min()), float(finite.max())
+    else:
+        wc, ww, dmin, dmax = 0.0, 1.0, 0.0, 0.0
+
+    # Per-axis spacing (X, Y, Z) from the affine column norms
+    sx = float(np.linalg.norm(affine[:3, 2]))
+    sy = float(np.linalg.norm(affine[:3, 1]))
+    sz = float(np.linalg.norm(affine[:3, 0]))
+
+    def _ras_to_lps(p):
+        return [float(-p[0]), float(-p[1]), float(p[2])]
+
+    ipp_first = _ras_to_lps((affine @ np.array([0,      0, 0, 1.0]))[:3])
+    ipp_last  = _ras_to_lps((affine @ np.array([nz - 1, 0, 0, 1.0]))[:3])
+
+    meta = {
+        "patient_name": "", "patient_id": "", "patient_dob": "",
+        "patient_sex": "", "patient_age": "",
+        "study_date": "", "study_description": "",
+        "series_description": path.name, "modality": "", "manufacturer": "",
+        "volume_shape": volume.shape,
+        "n_slices": nz,
+        "window_center": wc, "window_width": ww,
+        "data_min": dmin, "data_max": dmax,
+        "display_affine": affine,
+        "voxel_spacing": (sx, sy, sz),
+        # NIfTI has no DICOM tags; derive what is available from the affine.
+        "slice_thickness": None,           # (0018,0050) — not stored in NIfTI
+        "spacing_between_slices": None,    # (0018,0088) — not stored in NIfTI
+        "computed_slice_spacing": sz,      # uniform slice spacing along Z
+        "ipp_first": ipp_first,            # LPS mm of first slice origin
+        "ipp_last": ipp_last,
+        "nifti_dtype": nifti_dtype,
+        "nifti_orientation": nifti_orientation,
+        "nifti_dims": nifti_dims,
+        "source_path": str(path),
+        "source_name": path.name,
+        "source_kind": "nifti",
+    }
+    return volume, None, meta
 
 
 def _apply_rescale(ds, arr: np.ndarray) -> np.ndarray:
@@ -404,6 +496,30 @@ def export_nifti(datasets: list, output_path: str | Path, patient_name: str) -> 
     hdr.set_xyzt_units("mm", "sec")
     hdr.set_sform(affine, code=1)   # scanner RAS coordinates
     hdr.set_qform(affine, code=1)
+    hdr["descrip"] = f"Anon:{patient_name}".encode()[:80]
+
+    output_path = Path(output_path)
+    nib.save(img, str(output_path))
+    return output_path
+
+
+def export_nifti_volume(volume, affine, output_path: str | Path,
+                        patient_name: str) -> Path:
+    """Write a NIfTI from an in-memory volume + affine (used for NIfTI sources).
+
+    *volume* is the internal (Z, Y, X) array and *affine* maps [Z, Y, X, 1] → RAS,
+    so the saved file is geometry-correct. Only the pseudonym is stored in the
+    description field.
+    """
+    aff = np.asarray(affine, dtype=float)
+    img = nib.Nifti1Image(np.asarray(volume), aff)
+    hdr = img.header
+    hdr.set_xyzt_units("mm")
+    try:
+        hdr.set_sform(aff, code=1)
+        hdr.set_qform(aff, code=1)
+    except Exception:
+        pass
     hdr["descrip"] = f"Anon:{patient_name}".encode()[:80]
 
     output_path = Path(output_path)
