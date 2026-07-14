@@ -4,3 +4,6 @@ This is a small tool to anonymize DICOM files and upload them to the EXACT serve
 
 <img width="1412" height="920" alt="image" src="https://github.com/user-attachments/assets/b13eeccc-d46f-4216-a91b-4648ca1328c4" />
 
+SliceThickness (0018,0050)
+SpacingBetweenSlices (0018,0088)
+ImagePositionPatient (0020,0032) der ersten und letzten Schicht = IPP-First

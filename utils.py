@@ -1,6 +1,8 @@
 """DICOM loading, NIfTI export, and pseudonym generation."""
 
 from __future__ import annotations
+import csv
+import datetime
 import hashlib
 import random
 from pathlib import Path
@@ -116,6 +118,28 @@ def scan_dicom_folder(path: str | Path) -> list[dict]:
     return sorted(series.values(), key=lambda s: s["n_slices"], reverse=True)
 
 
+def _tag_float(ds, name: str) -> float | None:
+    """Return a DICOM float tag, or None if missing/unparseable."""
+    try:
+        v = getattr(ds, name, None)
+        if v is None or v == "":
+            return None
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _tag_vec(ds, name: str) -> list[float] | None:
+    """Return a DICOM multi-value tag as a list of floats, or None."""
+    try:
+        v = getattr(ds, name, None)
+        if v is None:
+            return None
+        return [float(x) for x in v]
+    except (TypeError, ValueError):
+        return None
+
+
 def load_dicom_series(
     path: str | Path,
     series_uid: str | None = None,
@@ -193,6 +217,27 @@ def load_dicom_series(
         meta["voxel_spacing"] = (float(ps[1]), float(ps[0]), abs(float(sp)))
     except Exception:
         meta["voxel_spacing"] = (1.0, 1.0, 1.0)
+
+    # ── DICOM geometry tags (for display + CSV export) ─────────────────────────
+    ds_last = datasets[-1]
+    meta["slice_thickness"]        = _tag_float(ds0, "SliceThickness")          # (0018,0050)
+    meta["spacing_between_slices"] = _tag_float(ds0, "SpacingBetweenSlices")    # (0018,0088)
+    ipp_first = _tag_vec(ds0,      "ImagePositionPatient")                       # (0020,0032)
+    ipp_last  = _tag_vec(ds_last,  "ImagePositionPatient")
+    meta["ipp_first"] = ipp_first
+    meta["ipp_last"]  = ipp_last
+
+    # True inter-slice spacing from the position tags = |IPP_last - IPP_first| / (N-1)
+    n_sl = volume.shape[0]
+    if ipp_first is not None and ipp_last is not None and n_sl > 1:
+        meta["computed_slice_spacing"] = float(
+            np.linalg.norm(np.array(ipp_last) - np.array(ipp_first)) / (n_sl - 1)
+        )
+    else:
+        meta["computed_slice_spacing"] = None
+
+    meta["source_path"] = str(path)
+    meta["source_name"] = Path(path).name
 
     return volume, datasets, meta
 
@@ -364,3 +409,62 @@ def export_nifti(datasets: list, output_path: str | Path, patient_name: str) -> 
     output_path = Path(output_path)
     nib.save(img, str(output_path))
     return output_path
+
+
+# ── Geometry CSV export ────────────────────────────────────────────────────────
+
+def _csv_scalar(v) -> str:
+    return "" if v is None else str(v)
+
+
+def _csv_vector(v) -> str:
+    if not v:
+        return ""
+    return ";".join(f"{float(x):.6g}" for x in v)
+
+
+def export_geometry_csv(meta: dict, out_dir: str | Path | None = None) -> Path:
+    """Write the DICOM geometry tags of the loaded series to a new CSV file.
+
+    A fresh, uniquely-named file is created on every call (timestamped), and it
+    records the original file/folder name and the creation date alongside the
+    tags. By default the CSV is written next to the loaded data; if that folder
+    is not writable, it falls back to the current working directory.
+    """
+    src = Path(meta.get("source_path") or ".")
+    if out_dir is None:
+        out_dir = src if src.is_dir() else src.parent
+    out_dir = Path(out_dir)
+
+    ts = datetime.datetime.now()
+    stamp = ts.strftime("%Y%m%d_%H%M%S")
+    base = meta.get("source_name") or "dicom"
+    safe = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in str(base))
+    fname = f"dicom_geometry_{safe}_{stamp}.csv"
+
+    rows = [
+        ("original_filename",                      _csv_scalar(meta.get("source_name"))),
+        ("source_path",                            _csv_scalar(meta.get("source_path"))),
+        ("created",                                ts.isoformat(timespec="seconds")),
+        ("n_slices",                               _csv_scalar(meta.get("n_slices"))),
+        ("SliceThickness_0018_0050",               _csv_scalar(meta.get("slice_thickness"))),
+        ("SpacingBetweenSlices_0018_0088",         _csv_scalar(meta.get("spacing_between_slices"))),
+        ("ImagePositionPatient_first_0020_0032",   _csv_vector(meta.get("ipp_first"))),
+        ("ImagePositionPatient_last_0020_0032",    _csv_vector(meta.get("ipp_last"))),
+        ("computed_slice_spacing_mm",              _csv_scalar(meta.get("computed_slice_spacing"))),
+        ("pixel_spacing_xyz_mm",                   _csv_vector(meta.get("voxel_spacing"))),
+    ]
+
+    def _write(target_dir: Path) -> Path:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        p = target_dir / fname
+        with open(p, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["field", "value"])
+            w.writerows(rows)
+        return p
+
+    try:
+        return _write(out_dir)
+    except OSError:
+        return _write(Path.cwd())

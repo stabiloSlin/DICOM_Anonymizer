@@ -231,6 +231,24 @@ def _sep() -> QFrame:
     return f
 
 
+def _fmt_num(v, nd: int = 3) -> str:
+    if v is None:
+        return ""
+    try:
+        return f"{float(v):.{nd}f}"
+    except (TypeError, ValueError):
+        return str(v)
+
+
+def _fmt_vec(v, nd: int = 2) -> str:
+    if not v:
+        return ""
+    try:
+        return ", ".join(f"{float(x):.{nd}f}" for x in v)
+    except (TypeError, ValueError):
+        return str(v)
+
+
 class _InfoRow(QWidget):
     """One metadata key-value row."""
 
@@ -262,7 +280,7 @@ class _LeftPanel(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self.setObjectName("LeftPanel")
-        self.setFixedWidth(240)
+        self.setFixedWidth(300)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(10, 10, 10, 10)
         outer.setSpacing(10)
@@ -281,6 +299,21 @@ class _LeftPanel(QWidget):
             v1.addWidget(w)
         grp1.setLayout(v1)
         outer.addWidget(grp1)
+
+        # DICOM geometry (slice spacing / positions)
+        grpg = QGroupBox("Geometry")
+        vg = QVBoxLayout()
+        vg.setSpacing(3)
+        self.geo_thick    = _InfoRow("SliceThk")   # (0018,0050)
+        self.geo_between  = _InfoRow("Spacing")    # (0018,0088)
+        self.geo_computed = _InfoRow("Δ/Slice")    # |IPP_last-IPP_first|/(N-1)
+        self.geo_ipp_first = _InfoRow("IPP first")  # (0020,0032)
+        self.geo_ipp_last  = _InfoRow("IPP last")
+        for w in [self.geo_thick, self.geo_between, self.geo_computed,
+                  self.geo_ipp_first, self.geo_ipp_last]:
+            vg.addWidget(w)
+        grpg.setLayout(vg)
+        outer.addWidget(grpg)
 
         # Patient info
         grp2 = QGroupBox("Original Patient")
@@ -369,6 +402,13 @@ class _LeftPanel(QWidget):
         self.pt_dob.set(meta.get("patient_dob", ""))
         self.pt_sex.set(meta.get("patient_sex", ""))
         self.pt_age.set(meta.get("patient_age", ""))
+
+        # Geometry
+        self.geo_thick.set(_fmt_num(meta.get("slice_thickness")))
+        self.geo_between.set(_fmt_num(meta.get("spacing_between_slices")))
+        self.geo_computed.set(_fmt_num(meta.get("computed_slice_spacing")))
+        self.geo_ipp_first.set(_fmt_vec(meta.get("ipp_first")))
+        self.geo_ipp_last.set(_fmt_vec(meta.get("ipp_last")))
 
     def update_coords(self, info: dict | None) -> None:
         """Update the live coordinate readout from a viewer hover event."""
@@ -851,6 +891,7 @@ class MainWindow(QMainWindow):
         self._datasets:  list | None = None
         self._meta:      dict        = {}
         self._last_nifti: str        = ""
+        self._last_geometry_csv: str | None = None
         self._exact_client = ec.ExactClient()
         self._settings  = QSettings("DicomAnonymizer", "DicomAnonymizer")
         self._workers: list[QThread] = []  # keep references alive
@@ -996,13 +1037,23 @@ class MainWindow(QMainWindow):
         seed = meta["patient_id"] if det else None
         self._right.pseudo_edit.setText(utils.generate_name(seed))
 
+        # Write a fresh geometry CSV for this load
+        self._last_geometry_csv = None
+        try:
+            self._last_geometry_csv = str(utils.export_geometry_csv(meta))
+        except Exception as exc:
+            print(f"Geometry CSV export failed: {exc}")
+
         n = meta.get("n_slices", "?")
         sh = meta.get("volume_shape", ())
         shape_str = f"{sh[2]}×{sh[1]}×{sh[0]}" if len(sh) == 3 else str(sh)
-        self.statusBar().showMessage(
+        msg = (
             f"Loaded {n} slices  —  {shape_str}  |  "
             f"{meta.get('modality', '')}  {meta.get('study_date', '')}"
         )
+        if self._last_geometry_csv:
+            msg += f"  |  Geometry CSV: {self._last_geometry_csv}"
+        self.statusBar().showMessage(msg)
 
     def _goto_coordinate(self, system: str, a: float, b: float, c: float) -> None:
         if self._datasets is None:

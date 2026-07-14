@@ -290,7 +290,11 @@ class _SliceView(QWidget):
             r = self.affine @ np.array([z, y, x, 1.0])
             ras = (float(r[0]), float(r[1]), float(r[2]))
         sx, sy, sz = self.spacing
-        world = (x * sx, y * sy, z * sz)   # image-coord mm from volume corner
+        ny = self.volume.shape[1]
+        # Image-coord mm matching the navigation device: X and Z from the volume
+        # corner, but Y measured from the *posterior* end (the array's Y index runs
+        # anterior→posterior, the device's Y runs the opposite way → mirror).
+        world = (x * sx, (ny - 1 - y) * sy, z * sz)
         return {
             "voxel": (x, y, z), "index": voxel,
             "ras": ras, "world": world, "value": value,
@@ -432,7 +436,8 @@ class DicomViewer(QWidget):
         elif system == "xyz":
             sx, sy, sz = self.axial.spacing
             x = int(round(a / sx)) if sx else 0
-            y = int(round(b / sy)) if sy else 0
+            # Y is mirrored to match the navigation device (see _build_info).
+            y = int(round((ny - 1) - b / sy)) if sy else 0
             z = int(round(c / sz)) if sz else 0
         elif system == "ras":
             aff = self.axial.affine
