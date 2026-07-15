@@ -17,6 +17,7 @@ from matplotlib.figure import Figure
 _BG = "#111320"
 _LABEL_COLOR = "#7fa8ff"
 _CROSSHAIR_COLOR = "#ff5a5a"
+_ORIENT_COLOR = "#6fd18c"
 
 
 class _SliceView(QWidget):
@@ -157,6 +158,16 @@ class _SliceView(QWidget):
         elif self.axis == 1: return np.flipud(v[:, idx, :])
         else:                return np.flipud(v[:, :, idx])
 
+    def _orient_labels(self) -> tuple[str, str]:
+        """(left_edge, right_edge) anatomical labels for this view.
+
+        Horizontal axis is X (→Left) for axial & coronal, so left=R, right=L.
+        For sagittal it is Y (→Posterior), so left=F (anterior), right=B (posterior).
+        """
+        if self.axis == 2:      # sagittal
+            return "F", "B"
+        return "R", "L"         # axial & coronal
+
     def _on_slider(self, value: int) -> None:
         self._refresh(value)
         self.slice_changed.emit(value)
@@ -197,6 +208,18 @@ class _SliceView(QWidget):
             )
             self._hline = self.ax.axhline(
                 y=0, color=_CROSSHAIR_COLOR, lw=0.8, alpha=0.9, visible=False,
+            )
+            # Orientation markers (fixed to the axes, not the data)
+            left_lbl, right_lbl = self._orient_labels()
+            self.ax.text(
+                0.015, 0.5, left_lbl, transform=self.ax.transAxes,
+                color=_ORIENT_COLOR, fontsize=11, fontweight="normal",
+                ha="left", va="center",
+            )
+            self.ax.text(
+                0.985, 0.5, right_lbl, transform=self.ax.transAxes,
+                color=_ORIENT_COLOR, fontsize=11, fontweight="normal",
+                ha="right", va="center",
             )
         else:
             self._im.set_data(s)
