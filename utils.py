@@ -1,6 +1,8 @@
 """DICOM loading, NIfTI export, and pseudonym generation."""
 
 from __future__ import annotations
+import csv
+import datetime
 import hashlib
 import random
 from pathlib import Path
@@ -17,6 +19,7 @@ _ADJECTIVES = [
     "Safe", "Soft", "Wild", "Warm", "Brave", "Fresh", "Grand", "Lean",
     "Mild", "Neat", "Rich", "Slim", "Strong", "Tall", "Wide", "Dark",
     "Smooth", "Stern", "Noble", "Brisk", "Crisp", "Fleet", "Stout", "Tidy",
+    
 ]
 
 _NOUNS = [
@@ -26,6 +29,13 @@ _NOUNS = [
     "Tide", "Trail", "Wave", "Wood", "Canyon", "Cliff", "Coast", "Crest",
     "Delta", "Glen", "Heath", "Inlet", "Isle", "Knoll", "Mesa", "Pass",
     "Pond", "Reef", "Sand", "Slope", "Dune", "Mound", "Birch", "Hazel",
+    "Trout", "Salmon", "Bass", "Pike", "Carp", "Perch", "Walleye",
+    "Cod", "Herring", "Mackerel", "Sardine", "Anchovy", "Grouper", "Snapper",
+    "Tuna", "Marlin", "Swordfish", "Flounder", "Halibut", "Tilapia", "Catfish",
+    "Sturgeon", "Barracuda", "Eel", "Garfish", "MahiMahi", "Sailfish", "Trout",
+    "Bluegill", "Crappie", "Dorado", "Perch", "Wahoo", "Zander","Yellowtail",
+    "Albacore", "Amberjack", "Butterfish", "Cobia", "Dorado", "Escolar", "Grouper",
+    "Zander","Hecht","Schmerle",
 ]
 
 
@@ -108,6 +118,28 @@ def scan_dicom_folder(path: str | Path) -> list[dict]:
     return sorted(series.values(), key=lambda s: s["n_slices"], reverse=True)
 
 
+def _tag_float(ds, name: str) -> float | None:
+    """Return a DICOM float tag, or None if missing/unparseable."""
+    try:
+        v = getattr(ds, name, None)
+        if v is None or v == "":
+            return None
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _tag_vec(ds, name: str) -> list[float] | None:
+    """Return a DICOM multi-value tag as a list of floats, or None."""
+    try:
+        v = getattr(ds, name, None)
+        if v is None:
+            return None
+        return [float(x) for x in v]
+    except (TypeError, ValueError):
+        return None
+
+
 def load_dicom_series(
     path: str | Path,
     series_uid: str | None = None,
@@ -174,7 +206,132 @@ def load_dicom_series(
     meta["data_min"] = int(volume.min())
     meta["data_max"] = int(volume.max())
 
+    # Affine mapping display index order (Z=slice, Y=row, X=col) → RAS mm.
+    meta["display_affine"] = build_display_affine(datasets)
+
+    # Per-axis voxel spacing in (X, Y, Z) = (col, row, slice) order, in mm.
+    # Used for the image-coordinate readout: coordinate = voxel_index * spacing,
+    # measured from the volume corner (matches external navigation devices).
+    try:
+        _, _, _, ps, sp, _ = _geometry(datasets)
+        meta["voxel_spacing"] = (float(ps[1]), float(ps[0]), abs(float(sp)))
+    except Exception:
+        meta["voxel_spacing"] = (1.0, 1.0, 1.0)
+
+    # ── DICOM geometry tags (for display + CSV export) ─────────────────────────
+    ds_last = datasets[-1]
+    meta["slice_thickness"]        = _tag_float(ds0, "SliceThickness")          # (0018,0050)
+    meta["spacing_between_slices"] = _tag_float(ds0, "SpacingBetweenSlices")    # (0018,0088)
+    ipp_first = _tag_vec(ds0,      "ImagePositionPatient")                       # (0020,0032)
+    ipp_last  = _tag_vec(ds_last,  "ImagePositionPatient")
+    meta["ipp_first"] = ipp_first
+    meta["ipp_last"]  = ipp_last
+
+    # True inter-slice spacing from the position tags = |IPP_last - IPP_first| / (N-1)
+    n_sl = volume.shape[0]
+    if ipp_first is not None and ipp_last is not None and n_sl > 1:
+        meta["computed_slice_spacing"] = float(
+            np.linalg.norm(np.array(ipp_last) - np.array(ipp_first)) / (n_sl - 1)
+        )
+    else:
+        meta["computed_slice_spacing"] = None
+
+    meta["source_path"] = str(path)
+    meta["source_name"] = Path(path).name
+    meta["source_kind"] = "dicom"
+
     return volume, datasets, meta
+
+
+def load_nifti(path: str | Path) -> tuple[np.ndarray, None, dict]:
+    """Load a NIfTI file into the same internal representation as a DICOM series.
+
+    Returns (volume, None, meta) where *volume* has shape (Z, Y, X) with the same
+    axis convention the DICOM path produces (axis0→Superior, axis1→Posterior,
+    axis2→Left), so the viewer, hovering, crosshair and coordinate logic behave
+    identically. *datasets* is None (NIfTI has no per-slice datasets).
+    """
+    from nibabel.orientations import (
+        io_orientation, axcodes2ornt, ornt_transform,
+        apply_orientation, inv_ornt_aff, aff2axcodes,
+    )
+
+    path = Path(path)
+    img = nib.load(str(path))
+
+    data = np.asanyarray(img.dataobj)          # raw stored dtype (keeps int16 for CT)
+    while data.ndim > 3:                       # drop any 4th+ dimension (e.g. time)
+        data = data[..., 0]
+
+    nifti_dtype       = str(data.dtype)
+    nifti_orientation = "".join(aff2axcodes(img.affine))   # native file orientation
+    nifti_dims        = "×".join(str(int(d)) for d in img.shape[:3])
+    # Apply intensity scaling if the header defines a non-trivial slope/intercept.
+    slope, inter = img.header.get_slope_inter()
+    if (slope not in (None, 1.0)) or (inter not in (None, 0.0)):
+        data = data.astype(np.float32) * (slope or 1.0) + (inter or 0.0)
+    if data.dtype == np.float64:
+        data = data.astype(np.float32)
+
+    # Reorient the array to the DICOM internal layout: (Z, Y, X) with
+    # axis0→Superior, axis1→Posterior, axis2→Left.
+    orig_ornt = io_orientation(img.affine)
+    targ_ornt = axcodes2ornt(("S", "P", "L"))
+    xfm       = ornt_transform(orig_ornt, targ_ornt)
+    volume    = np.ascontiguousarray(apply_orientation(data, xfm))
+    affine    = img.affine @ inv_ornt_aff(xfm, data.shape)   # [Z,Y,X,1] → RAS mm
+
+    nz, ny, nx = volume.shape
+
+    # Window / level from robust statistics. Use the MIDPOINT of the p1–p99
+    # range as the centre (not the median): CT/CBCT volumes are dominated by
+    # air, which drags the median low and washes the image out too bright.
+    finite = volume[np.isfinite(volume)]
+    if finite.size:
+        lo = float(np.percentile(finite, 1))
+        hi = float(np.percentile(finite, 99))
+        wc = (lo + hi) / 2.0
+        ww = max(hi - lo, 1.0)
+        dmin, dmax = float(finite.min()), float(finite.max())
+    else:
+        wc, ww, dmin, dmax = 0.0, 1.0, 0.0, 0.0
+
+    # Per-axis spacing (X, Y, Z) from the affine column norms
+    sx = float(np.linalg.norm(affine[:3, 2]))
+    sy = float(np.linalg.norm(affine[:3, 1]))
+    sz = float(np.linalg.norm(affine[:3, 0]))
+
+    def _ras_to_lps(p):
+        return [float(-p[0]), float(-p[1]), float(p[2])]
+
+    ipp_first = _ras_to_lps((affine @ np.array([0,      0, 0, 1.0]))[:3])
+    ipp_last  = _ras_to_lps((affine @ np.array([nz - 1, 0, 0, 1.0]))[:3])
+
+    meta = {
+        "patient_name": "", "patient_id": "", "patient_dob": "",
+        "patient_sex": "", "patient_age": "",
+        "study_date": "", "study_description": "",
+        "series_description": path.name, "modality": "", "manufacturer": "",
+        "volume_shape": volume.shape,
+        "n_slices": nz,
+        "window_center": wc, "window_width": ww,
+        "data_min": dmin, "data_max": dmax,
+        "display_affine": affine,
+        "voxel_spacing": (sx, sy, sz),
+        # NIfTI has no DICOM tags; derive what is available from the affine.
+        "slice_thickness": None,           # (0018,0050) — not stored in NIfTI
+        "spacing_between_slices": None,    # (0018,0088) — not stored in NIfTI
+        "computed_slice_spacing": sz,      # uniform slice spacing along Z
+        "ipp_first": ipp_first,            # LPS mm of first slice origin
+        "ipp_last": ipp_last,
+        "nifti_dtype": nifti_dtype,
+        "nifti_orientation": nifti_orientation,
+        "nifti_dims": nifti_dims,
+        "source_path": str(path),
+        "source_name": path.name,
+        "source_kind": "nifti",
+    }
+    return volume, None, meta
 
 
 def _apply_rescale(ds, arr: np.ndarray) -> np.ndarray:
@@ -241,6 +398,34 @@ _ANON_TAGS = [
 ]
 
 
+def _geometry(datasets: list):
+    """Return (row_cos, col_cos, normal, ps, spacing, ipp) from DICOM tags.
+
+    row_cos : direction of increasing column index (iop[:3])
+    col_cos : direction of increasing row index    (iop[3:])
+    normal  : slice normal = row_cos × col_cos
+    ps      : [row_spacing, col_spacing] in mm
+    spacing : signed inter-slice spacing along the normal
+    ipp     : ImagePositionPatient of the first slice (LPS mm)
+    """
+    ds  = datasets[0]
+    iop = [float(x) for x in ds.ImageOrientationPatient]
+    ipp = np.array([float(x) for x in ds.ImagePositionPatient])
+    ps  = [float(x) for x in ds.PixelSpacing]   # [row_spacing, col_spacing]
+
+    row_cos = np.array(iop[:3])
+    col_cos = np.array(iop[3:])
+    normal  = np.cross(row_cos, col_cos)
+
+    if len(datasets) > 1:
+        ipp2    = np.array([float(x) for x in datasets[1].ImagePositionPatient])
+        spacing = float(np.dot(ipp2 - ipp, normal))
+    else:
+        spacing = float(getattr(ds, "SliceThickness", 1.0) or 1.0)
+
+    return row_cos, col_cos, normal, ps, spacing, ipp
+
+
 def _build_affine(datasets: list) -> np.ndarray:
     """Construct a NIfTI-RAS affine from DICOM orientation/position tags.
 
@@ -248,22 +433,8 @@ def _build_affine(datasets: list) -> np.ndarray:
     DICOM coordinates are in LPS; we convert to NIfTI-RAS by negating the
     first two rows of the affine (flip L→R and P→A).
     """
-    ds = datasets[0]
     try:
-        iop = [float(x) for x in ds.ImageOrientationPatient]
-        ipp = np.array([float(x) for x in ds.ImagePositionPatient])
-        ps  = [float(x) for x in ds.PixelSpacing]   # [row_spacing, col_spacing]
-
-        row_cos = np.array(iop[:3])   # direction of increasing column index
-        col_cos = np.array(iop[3:])   # direction of increasing row index
-        normal  = np.cross(row_cos, col_cos)
-
-        if len(datasets) > 1:
-            ipp2    = np.array([float(x) for x in datasets[1].ImagePositionPatient])
-            # Signed projection onto normal — preserves direction relative to slice order
-            spacing = float(np.dot(ipp2 - ipp, normal))
-        else:
-            spacing = float(getattr(ds, "SliceThickness", 1.0) or 1.0)
+        row_cos, col_cos, normal, ps, spacing, ipp = _geometry(datasets)
 
         # LPS affine: maps (row_idx, col_idx, slice_idx) → LPS mm
         affine_lps = np.eye(4)
@@ -273,6 +444,34 @@ def _build_affine(datasets: list) -> np.ndarray:
         affine_lps[:3, 3] = ipp
 
         # LPS → RAS: negate X and Y components (rows 0 and 1)
+        lps_to_ras = np.diag([-1., -1., 1., 1.])
+        return lps_to_ras @ affine_lps
+
+    except Exception:
+        return np.eye(4)
+
+
+def build_display_affine(datasets: list) -> np.ndarray:
+    """RAS affine for the *display* volume index order (Z=slice, Y=row, X=col).
+
+    The viewer stacks slices on axis 0, so its volume has shape
+    (n_slices, Rows, Cols) == (Z, Y, X). This affine maps a homogeneous
+    index vector [Z, Y, X, 1] to Slicer-style RAS millimetres, following the
+    LPS→RAS convention used throughout (3D Slicer stores coordinates in RAS).
+
+    Returns the 4x4 identity if orientation tags are missing, so callers can
+    always assume a usable matrix.
+    """
+    try:
+        row_cos, col_cos, normal, ps, spacing, ipp = _geometry(datasets)
+
+        # LPS affine for index order (slice, row, col):
+        affine_lps = np.eye(4)
+        affine_lps[:3, 0] = normal  * spacing  # dim-0 = slices (Z)
+        affine_lps[:3, 1] = col_cos * ps[0]    # dim-1 = rows   (Y)
+        affine_lps[:3, 2] = row_cos * ps[1]    # dim-2 = cols   (X)
+        affine_lps[:3, 3] = ipp
+
         lps_to_ras = np.diag([-1., -1., 1., 1.])
         return lps_to_ras @ affine_lps
 
@@ -302,3 +501,86 @@ def export_nifti(datasets: list, output_path: str | Path, patient_name: str) -> 
     output_path = Path(output_path)
     nib.save(img, str(output_path))
     return output_path
+
+
+def export_nifti_volume(volume, affine, output_path: str | Path,
+                        patient_name: str) -> Path:
+    """Write a NIfTI from an in-memory volume + affine (used for NIfTI sources).
+
+    *volume* is the internal (Z, Y, X) array and *affine* maps [Z, Y, X, 1] → RAS,
+    so the saved file is geometry-correct. Only the pseudonym is stored in the
+    description field.
+    """
+    aff = np.asarray(affine, dtype=float)
+    img = nib.Nifti1Image(np.asarray(volume), aff)
+    hdr = img.header
+    hdr.set_xyzt_units("mm")
+    try:
+        hdr.set_sform(aff, code=1)
+        hdr.set_qform(aff, code=1)
+    except Exception:
+        pass
+    hdr["descrip"] = f"Anon:{patient_name}".encode()[:80]
+
+    output_path = Path(output_path)
+    nib.save(img, str(output_path))
+    return output_path
+
+
+# ── Geometry CSV export ────────────────────────────────────────────────────────
+
+def _csv_scalar(v) -> str:
+    return "" if v is None else str(v)
+
+
+def _csv_vector(v) -> str:
+    if not v:
+        return ""
+    return ";".join(f"{float(x):.6g}" for x in v)
+
+
+def export_geometry_csv(meta: dict, out_dir: str | Path | None = None) -> Path:
+    """Write the DICOM geometry tags of the loaded series to a new CSV file.
+
+    A fresh, uniquely-named file is created on every call (timestamped), and it
+    records the original file/folder name and the creation date alongside the
+    tags. By default the CSV is written next to the loaded data; if that folder
+    is not writable, it falls back to the current working directory.
+    """
+    src = Path(meta.get("source_path") or ".")
+    if out_dir is None:
+        out_dir = src if src.is_dir() else src.parent
+    out_dir = Path(out_dir)
+
+    ts = datetime.datetime.now()
+    stamp = ts.strftime("%Y%m%d_%H%M%S")
+    base = meta.get("source_name") or "dicom"
+    safe = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in str(base))
+    fname = f"dicom_geometry_{safe}_{stamp}.csv"
+
+    rows = [
+        ("original_filename",                      _csv_scalar(meta.get("source_name"))),
+        ("source_path",                            _csv_scalar(meta.get("source_path"))),
+        ("created",                                ts.isoformat(timespec="seconds")),
+        ("n_slices",                               _csv_scalar(meta.get("n_slices"))),
+        ("SliceThickness_0018_0050",               _csv_scalar(meta.get("slice_thickness"))),
+        ("SpacingBetweenSlices_0018_0088",         _csv_scalar(meta.get("spacing_between_slices"))),
+        ("ImagePositionPatient_first_0020_0032",   _csv_vector(meta.get("ipp_first"))),
+        ("ImagePositionPatient_last_0020_0032",    _csv_vector(meta.get("ipp_last"))),
+        ("computed_slice_spacing_mm",              _csv_scalar(meta.get("computed_slice_spacing"))),
+        ("pixel_spacing_xyz_mm",                   _csv_vector(meta.get("voxel_spacing"))),
+    ]
+
+    def _write(target_dir: Path) -> Path:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        p = target_dir / fname
+        with open(p, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["field", "value"])
+            w.writerows(rows)
+        return p
+
+    try:
+        return _write(out_dir)
+    except OSError:
+        return _write(Path.cwd())

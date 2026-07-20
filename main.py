@@ -25,10 +25,10 @@ from PyQt6.QtWidgets import (
     QSlider, QComboBox, QScrollArea, QFileDialog, QMessageBox,
     QStackedWidget, QRadioButton, QButtonGroup, QFrame, QToolBar,
     QSpinBox, QSizePolicy, QDialog, QTableWidget, QTableWidgetItem,
-    QHeaderView, QDialogButtonBox,
+    QHeaderView, QDialogButtonBox, QToolButton,
 )
 from PyQt6.QtCore import Qt, QSettings, QThread, pyqtSignal
-from PyQt6.QtGui import QAction, QFont, QGuiApplication
+from PyQt6.QtGui import QAction, QFont, QGuiApplication, QDoubleValidator
 
 import utils
 import exact_client as ec
@@ -231,6 +231,64 @@ def _sep() -> QFrame:
     return f
 
 
+def _fmt_num(v, nd: int = 3) -> str:
+    if v is None:
+        return ""
+    try:
+        return f"{float(v):.{nd}f}"
+    except (TypeError, ValueError):
+        return str(v)
+
+
+def _fmt_vec(v, nd: int = 2) -> str:
+    if not v:
+        return ""
+    try:
+        return ", ".join(f"{float(x):.{nd}f}" for x in v)
+    except (TypeError, ValueError):
+        return str(v)
+
+
+class _CollapsibleBox(QWidget):
+    """A section with a clickable header that shows/hides its content."""
+
+    def __init__(self, title: str, expanded: bool = True) -> None:
+        super().__init__()
+        self._btn = QToolButton()
+        self._btn.setText(title)
+        self._btn.setCheckable(True)
+        self._btn.setChecked(expanded)
+        self._btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self._btn.setArrowType(
+            Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow
+        )
+        self._btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn.setStyleSheet(
+            "QToolButton{border:none;color:#7fa8ff;font-weight:700;font-size:12px;"
+            "letter-spacing:0.4px;padding:4px 2px;text-align:left;}"
+            "QToolButton:hover{color:#a9c4ff;}"
+        )
+        self._btn.toggled.connect(self._on_toggled)
+
+        self._content = QWidget()
+        self._content.setVisible(expanded)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(2)
+        lay.addWidget(self._btn)
+        lay.addWidget(self._content)
+
+    def setContentLayout(self, layout) -> None:
+        self._content.setLayout(layout)
+
+    def _on_toggled(self, checked: bool) -> None:
+        self._btn.setArrowType(
+            Qt.ArrowType.DownArrow if checked else Qt.ArrowType.RightArrow
+        )
+        self._content.setVisible(checked)
+
+
 class _InfoRow(QWidget):
     """One metadata key-value row."""
 
@@ -254,12 +312,22 @@ class _InfoRow(QWidget):
 
 # ── Left panel (metadata display) ────────────────────────────────────────────
 
-class _LeftPanel(QWidget):
+class _LeftPanel(QScrollArea):
+    # Emitted when the user requests navigation to a typed coordinate.
+    #   (system, a, b, c) where system is "ras" | "voxel" | "xyz"
+    goto_requested = pyqtSignal(str, float, float, float)
+
     def __init__(self) -> None:
         super().__init__()
-        self.setObjectName("LeftPanel")
-        self.setFixedWidth(240)
-        outer = QVBoxLayout(self)
+        self.setWidgetResizable(True)
+        self.setFixedWidth(300)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+        container = QWidget()
+        container.setObjectName("LeftPanel")
+        self.setWidget(container)
+
+        outer = QVBoxLayout(container)
         outer.setContentsMargins(10, 10, 10, 10)
         outer.setSpacing(10)
 
@@ -278,9 +346,77 @@ class _LeftPanel(QWidget):
         grp1.setLayout(v1)
         outer.addWidget(grp1)
 
-        # Patient info
-        grp2 = QGroupBox("Original Patient")
+        # DICOM geometry (slice spacing / positions)
+        grpg = QGroupBox("Geometry")
+        vg = QVBoxLayout()
+        vg.setSpacing(3)
+        self.geo_thick    = _InfoRow("SliceThk")   # (0018,0050)
+        self.geo_between  = _InfoRow("Spacing")    # (0018,0088)
+        self.geo_computed = _InfoRow("Δ/Slice")    # |IPP_last-IPP_first|/(N-1)
+        self.geo_ipp_first = _InfoRow("IPP first")  # (0020,0032)
+        self.geo_ipp_last  = _InfoRow("IPP last")
+        for w in [self.geo_thick, self.geo_between, self.geo_computed,
+                  self.geo_ipp_first, self.geo_ipp_last]:
+            vg.addWidget(w)
+        grpg.setLayout(vg)
+        outer.addWidget(grpg)
+
+        # Format-specific info (collapsible; auto-selected by loaded format)
+        boxf = _CollapsibleBox("Format", expanded=False)
+        vf = QVBoxLayout()
+        vf.setContentsMargins(8, 0, 4, 4)
+        vf.setSpacing(5)
+
+        fmt_row = QHBoxLayout()
+        self.fmt_dicom = QRadioButton("DICOM")
+        self.fmt_nifti = QRadioButton("NIfTI")
+        self.fmt_dicom.setChecked(True)
+        grp_fmt = QButtonGroup(self)
+        grp_fmt.addButton(self.fmt_dicom)
+        grp_fmt.addButton(self.fmt_nifti)
+        fmt_row.addWidget(self.fmt_dicom)
+        fmt_row.addWidget(self.fmt_nifti)
+        vf.addLayout(fmt_row)
+
+        self.fmt_stack = QStackedWidget()
+
+        # DICOM page
+        dpage = QWidget()
+        dl = QVBoxLayout(dpage)
+        dl.setContentsMargins(0, 0, 0, 0)
+        dl.setSpacing(3)
+        self.dcm_modality = _InfoRow("Modality")
+        self.dcm_manuf    = _InfoRow("Maker")
+        self.dcm_voxel    = _InfoRow("Voxel mm")
+        for w in [self.dcm_modality, self.dcm_manuf, self.dcm_voxel]:
+            dl.addWidget(w)
+        self.fmt_stack.addWidget(dpage)
+
+        # NIfTI page
+        npage = QWidget()
+        nl = QVBoxLayout(npage)
+        nl.setContentsMargins(0, 0, 0, 0)
+        nl.setSpacing(3)
+        self.nii_voxel  = _InfoRow("Voxel mm")
+        self.nii_dtype  = _InfoRow("Data type")
+        self.nii_orient = _InfoRow("Orient")
+        self.nii_dims   = _InfoRow("Dims")
+        for w in [self.nii_voxel, self.nii_dtype, self.nii_orient, self.nii_dims]:
+            nl.addWidget(w)
+        self.fmt_stack.addWidget(npage)
+
+        vf.addWidget(self.fmt_stack)
+        boxf.setContentLayout(vf)
+        outer.addWidget(boxf)
+
+        self.fmt_dicom.toggled.connect(
+            lambda checked: self.fmt_stack.setCurrentIndex(0 if checked else 1)
+        )
+
+        # Patient info (collapsible)
+        box2 = _CollapsibleBox("Original Patient", expanded=False)
         v2 = QVBoxLayout()
+        v2.setContentsMargins(8, 0, 4, 4)
         v2.setSpacing(3)
         self.pt_name = _InfoRow("Name")
         self.pt_id   = _InfoRow("ID")
@@ -290,8 +426,64 @@ class _LeftPanel(QWidget):
         for w in [self.pt_name, self.pt_id, self.pt_dob,
                   self.pt_sex, self.pt_age]:
             v2.addWidget(w)
-        grp2.setLayout(v2)
-        outer.addWidget(grp2)
+        box2.setContentLayout(v2)
+        outer.addWidget(box2)
+
+        # Coordinates (live cursor readout)
+        grp3 = QGroupBox("Coordinates")
+        v3 = QVBoxLayout()
+        v3.setSpacing(3)
+        hint = QLabel("Hover over a view")
+        hint.setObjectName("MetaKey")
+        v3.addWidget(hint)
+        self.coord_ras   = _InfoRow("RAS mm")
+        self.coord_voxel = _InfoRow("Voxel")
+        self.coord_value = _InfoRow("Value")
+        for w in [self.coord_ras, self.coord_voxel, self.coord_value]:
+            v3.addWidget(w)
+
+        # Image-coordinate mm (index × spacing, volume-corner origin) —
+        # matches the external navigation device readout.
+        self.coord_x = _InfoRow("x")
+        self.coord_y = _InfoRow("y")
+        self.coord_z = _InfoRow("z")
+        for w in [self.coord_x, self.coord_y, self.coord_z]:
+            v3.addWidget(w)
+
+        grp3.setLayout(v3)
+        outer.addWidget(grp3)
+
+        # Go-to-coordinate input
+        grp4 = QGroupBox("Gehe zu Koordinate")
+        v4 = QVBoxLayout()
+        v4.setSpacing(5)
+
+        # Coordinate-system selector at the top
+        self.goto_system = QComboBox()
+        self.goto_system.addItems(["RAS mm", "Voxel", "XYZ"])
+        self.goto_system.currentTextChanged.connect(self._update_goto_hints)
+        v4.addWidget(self.goto_system)
+
+        # Three input fields
+        fields_row = QHBoxLayout()
+        fields_row.setSpacing(4)
+        self.goto_a = QLineEdit()
+        self.goto_b = QLineEdit()
+        self.goto_c = QLineEdit()
+        for e in (self.goto_a, self.goto_b, self.goto_c):
+            e.setValidator(QDoubleValidator())
+            e.returnPressed.connect(self._emit_goto)
+            fields_row.addWidget(e)
+        v4.addLayout(fields_row)
+
+        # Update button
+        self.goto_btn = QPushButton("Aktualisieren")
+        self.goto_btn.clicked.connect(self._emit_goto)
+        v4.addWidget(self.goto_btn)
+
+        grp4.setLayout(v4)
+        outer.addWidget(grp4)
+        self._update_goto_hints(self.goto_system.currentText())
 
         outer.addStretch()
 
@@ -309,6 +501,76 @@ class _LeftPanel(QWidget):
         self.pt_dob.set(meta.get("patient_dob", ""))
         self.pt_sex.set(meta.get("patient_sex", ""))
         self.pt_age.set(meta.get("patient_age", ""))
+
+        # Geometry
+        self.geo_thick.set(_fmt_num(meta.get("slice_thickness")))
+        self.geo_between.set(_fmt_num(meta.get("spacing_between_slices")))
+        self.geo_computed.set(_fmt_num(meta.get("computed_slice_spacing")))
+        self.geo_ipp_first.set(_fmt_vec(meta.get("ipp_first")))
+        self.geo_ipp_last.set(_fmt_vec(meta.get("ipp_last")))
+
+        # Format panel — fill both pages, then auto-select the loaded format
+        vox = _fmt_vec(meta.get("voxel_spacing"), nd=3)
+        self.dcm_modality.set(meta.get("modality", ""))
+        self.dcm_manuf.set(meta.get("manufacturer", ""))
+        self.dcm_voxel.set(vox)
+        self.nii_voxel.set(vox)
+        self.nii_dtype.set(meta.get("nifti_dtype", ""))
+        self.nii_orient.set(meta.get("nifti_orientation", ""))
+        self.nii_dims.set(meta.get("nifti_dims", ""))
+        if meta.get("source_kind") == "nifti":
+            self.fmt_nifti.setChecked(True)
+        else:
+            self.fmt_dicom.setChecked(True)
+
+    def update_coords(self, info: dict | None) -> None:
+        """Update the live coordinate readout from a viewer hover event."""
+        if not info:
+            for w in (self.coord_ras, self.coord_voxel, self.coord_value,
+                      self.coord_x, self.coord_y, self.coord_z):
+                w.set("")
+            return
+        ras = info.get("ras")
+        if ras is not None:
+            self.coord_ras.set(f"{ras[0]:.1f}, {ras[1]:.1f}, {ras[2]:.1f}")
+        else:
+            self.coord_ras.set("n/a")
+        vx = info.get("voxel")
+        if vx is not None:
+            self.coord_voxel.set(f"{vx[0]}, {vx[1]}, {vx[2]}")
+        val = info.get("value")
+        if val is not None:
+            self.coord_value.set(f"{val:.0f}")
+        world = info.get("world")
+        if world is not None:
+            self.coord_x.set(f"{world[0]:.2f} mm")
+            self.coord_y.set(f"{world[1]:.2f} mm")
+            self.coord_z.set(f"{world[2]:.2f} mm")
+
+    # ── Go-to-coordinate ───────────────────────────────────────────────────────
+
+    _GOTO_HINTS = {
+        "RAS mm": ("R", "A", "S"),
+        "Voxel":  ("x", "y", "z"),
+        "XYZ":    ("x mm", "y mm", "z mm"),
+    }
+    _GOTO_KEYS = {"RAS mm": "ras", "Voxel": "voxel", "XYZ": "xyz"}
+
+    def _update_goto_hints(self, system_text: str) -> None:
+        a, b, c = self._GOTO_HINTS.get(system_text, ("x", "y", "z"))
+        self.goto_a.setPlaceholderText(a)
+        self.goto_b.setPlaceholderText(b)
+        self.goto_c.setPlaceholderText(c)
+
+    def _emit_goto(self) -> None:
+        key = self._GOTO_KEYS.get(self.goto_system.currentText(), "voxel")
+        try:
+            a = float(self.goto_a.text().replace(",", "."))
+            b = float(self.goto_b.text().replace(",", "."))
+            c = float(self.goto_c.text().replace(",", "."))
+        except ValueError:
+            return
+        self.goto_requested.emit(key, a, b, c)
 
 
 # ── Right panel (anonymisation + export) ─────────────────────────────────────
@@ -592,22 +854,48 @@ class _LoadWorker(QThread):
             self.error.emit('Error in _LoadWorker: ' + str(exc))
 
 
+class _NiftiLoadWorker(QThread):
+    done  = pyqtSignal(object, object, object)
+    error = pyqtSignal(str)
+
+    def __init__(self, path: str) -> None:
+        super().__init__()
+        self._path = path
+
+    def run(self) -> None:
+        try:
+            volume, datasets, meta = utils.load_nifti(self._path)
+            self.done.emit(volume, datasets, meta)
+        except Exception as exc:
+            self.error.emit('Error loading NIfTI: ' + str(exc))
+
+
 class _ExportWorker(QThread):
     done  = pyqtSignal(str)
     error = pyqtSignal(str)
 
-    def __init__(self, datasets, output_path: str, pseudonym: str) -> None:
+    def __init__(self, datasets, output_path: str, pseudonym: str,
+                 volume=None, affine=None) -> None:
         super().__init__()
         self._datasets = datasets
         self._output   = output_path
         self._name     = pseudonym
+        self._volume   = volume
+        self._affine   = affine
 
     def run(self) -> None:
         try:
-            utils.export_nifti(self._datasets, self._output, self._name)
+            if self._datasets:
+                utils.export_nifti(self._datasets, self._output, self._name)
+            elif self._volume is not None:
+                utils.export_nifti_volume(
+                    self._volume, self._affine, self._output, self._name
+                )
+            else:
+                raise ValueError("No data loaded to export.")
             self.done.emit(self._output)
         except Exception as exc:
-            self.error.emit('Error in _ExportWorker'+str(exc))
+            self.error.emit('Error in _ExportWorker: ' + str(exc))
 
 
 class _ConnectWorker(QThread):
@@ -740,8 +1028,11 @@ class MainWindow(QMainWindow):
         self.resize(1300, 780)
 
         self._datasets:  list | None = None
+        self._volume = None
+        self._display_affine = None
         self._meta:      dict        = {}
         self._last_nifti: str        = ""
+        self._last_geometry_csv: str | None = None
         self._exact_client = ec.ExactClient()
         self._settings  = QSettings("DicomAnonymizer", "DicomAnonymizer")
         self._workers: list[QThread] = []  # keep references alive
@@ -790,6 +1081,8 @@ class MainWindow(QMainWindow):
         self._right.wl_changed.connect(
             lambda wc, ww: self._viewer.set_wl(wc, ww)
         )
+        self._viewer.coords_changed.connect(self._left.update_coords)
+        self._left.goto_requested.connect(self._goto_coordinate)
         self._right.export_nifti_req.connect(self._export_nifti)
         self._right.connect_req.connect(self._connect_exact)
         self._right.export_exact_req.connect(self._export_exact)
@@ -817,6 +1110,11 @@ class MainWindow(QMainWindow):
         open_dir.triggered.connect(self._open_dir)
         tb.addAction(open_dir)
 
+        open_nifti = QAction("Open NIfTI File …", self)
+        open_nifti.setShortcut("Ctrl+N")
+        open_nifti.triggered.connect(self._open_nifti)
+        tb.addAction(open_nifti)
+
         tb.addSeparator()
 
         about = QAction("About", self)
@@ -838,9 +1136,24 @@ class MainWindow(QMainWindow):
         if path:
             self._load_path(path)
 
+    def _open_nifti(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open NIfTI File", "",
+            "NIfTI (*.nii *.nii.gz);;All files (*)"
+        )
+        if path:
+            self._load_path(path)
+
+    @staticmethod
+    def _is_nifti(path: str) -> bool:
+        low = Path(path).name.lower()
+        return low.endswith(".nii") or low.endswith(".nii.gz")
+
     def _load_path(self, path: str) -> None:
         self._viewer.clear()
-        if Path(path).is_dir():
+        if self._is_nifti(path):
+            self._start_load_nifti(path)
+        elif Path(path).is_dir():
             self.statusBar().showMessage(f"Scanning {path} …")
             scanner = _ScanWorker(path)
             scanner.done.connect(lambda series: self._on_scanned(path, series))
@@ -849,6 +1162,14 @@ class MainWindow(QMainWindow):
             scanner.start()
         else:
             self._start_load(path, series_uid=None)
+
+    def _start_load_nifti(self, path: str) -> None:
+        self.statusBar().showMessage(f"Loading {path} …")
+        worker = _NiftiLoadWorker(path)
+        worker.done.connect(self._on_loaded)
+        worker.error.connect(self._on_load_error)
+        self._workers.append(worker)
+        worker.start()
 
     def _on_scanned(self, path: str, series: list[dict]) -> None:
         if len(series) <= 1:
@@ -870,10 +1191,15 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def _on_loaded(self, volume, datasets, meta) -> None:
-        self._datasets = datasets
-        self._meta     = meta
+        self._datasets       = datasets
+        self._volume         = volume
+        self._display_affine = meta.get("display_affine")
+        self._meta           = meta
         self._left.update(meta)
-        self._viewer.load_volume(volume, meta["window_center"], meta["window_width"])
+        self._viewer.load_volume(
+            volume, meta["window_center"], meta["window_width"],
+            meta.get("display_affine"), meta.get("voxel_spacing"),
+        )
         self._right.set_wl_defaults(meta["window_center"], meta["window_width"])
         self._right.set_loaded(meta["patient_name"], meta["patient_id"])
 
@@ -882,13 +1208,37 @@ class MainWindow(QMainWindow):
         seed = meta["patient_id"] if det else None
         self._right.pseudo_edit.setText(utils.generate_name(seed))
 
+        # Write a fresh geometry CSV for this load
+        self._last_geometry_csv = None
+        try:
+            self._last_geometry_csv = str(utils.export_geometry_csv(meta))
+        except Exception as exc:
+            print(f"Geometry CSV export failed: {exc}")
+
         n = meta.get("n_slices", "?")
         sh = meta.get("volume_shape", ())
         shape_str = f"{sh[2]}×{sh[1]}×{sh[0]}" if len(sh) == 3 else str(sh)
-        self.statusBar().showMessage(
+        msg = (
             f"Loaded {n} slices  —  {shape_str}  |  "
             f"{meta.get('modality', '')}  {meta.get('study_date', '')}"
         )
+        if self._last_geometry_csv:
+            msg += f"  |  Geometry CSV: {self._last_geometry_csv}"
+        self.statusBar().showMessage(msg)
+
+    def _goto_coordinate(self, system: str, a: float, b: float, c: float) -> None:
+        if self._volume is None:
+            self.statusBar().showMessage("Keine Daten geladen.")
+            return
+        ok = self._viewer.goto(system, a, b, c)
+        if ok:
+            self.statusBar().showMessage(
+                f"Navigiert zu {system.upper()}: {a:g}, {b:g}, {c:g}"
+            )
+        elif system == "ras":
+            self.statusBar().showMessage(
+                "RAS-Navigation nicht verfügbar (keine gültige Orientierung im DICOM)."
+            )
 
     def _on_load_error(self, msg: str) -> None:
         print('Showing message: ',msg)
@@ -912,7 +1262,7 @@ class MainWindow(QMainWindow):
     # ── NIfTI export ──────────────────────────────────────────────────────────
 
     def _export_nifti(self) -> None:
-        if not self._datasets:
+        if not self._datasets and self._volume is None:
             return
         pseudo = self._right.pseudo_edit.text().strip()
         if not pseudo:
@@ -929,7 +1279,8 @@ class MainWindow(QMainWindow):
             return
 
         self.statusBar().showMessage("Exporting NIfTI …")
-        worker = _ExportWorker(self._datasets, path, pseudo)
+        worker = _ExportWorker(self._datasets, path, pseudo,
+                               volume=self._volume, affine=self._display_affine)
         worker.done.connect(self._on_nifti_done)
         worker.error.connect(self._on_export_error)
         self._workers.append(worker)
@@ -998,8 +1349,8 @@ class MainWindow(QMainWindow):
     # ── EXACT upload ──────────────────────────────────────────────────────────
 
     def _export_exact(self) -> None:
-        if not self._datasets:
-            QMessageBox.warning(self, "No DICOM", "Load a DICOM series first.")
+        if not self._datasets and self._volume is None:
+            QMessageBox.warning(self, "No Data", "Load a DICOM series or NIfTI first.")
             return
 
         image_set_id = self._right.selected_image_set_id()
@@ -1023,7 +1374,8 @@ class MainWindow(QMainWindow):
             )
             tmp.close()
             self.statusBar().showMessage("Preparing NIfTI for upload …")
-            worker = _ExportWorker(self._datasets, tmp.name, pseudo)
+            worker = _ExportWorker(self._datasets, tmp.name, pseudo,
+                                   volume=self._volume, affine=self._display_affine)
             worker.done.connect(
                 lambda p: self._do_upload(p, image_set_id, pseudo)
             )
